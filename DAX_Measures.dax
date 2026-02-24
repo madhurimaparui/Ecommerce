@@ -1,0 +1,183 @@
+// ============================================================
+// DAX Measures — E-Commerce Sales Intelligence Platform
+// Author: Madhurima Parui
+// Data Sources: SQL Server + Excel + SharePoint + REST API
+// ============================================================
+
+// ── CORE KPIs ──────────────────────────────────────────────
+
+Total Revenue =
+SUM(fact_sales[revenue])
+
+Total Cost =
+SUM(fact_sales[cost])
+
+Total Profit =
+SUM(fact_sales[profit])
+
+Profit Margin % =
+DIVIDE([Total Profit], [Total Revenue], 0) * 100
+
+Total Orders =
+DISTINCTCOUNT(fact_sales[order_id])
+
+Total Units Sold =
+SUM(fact_sales[quantity])
+
+Avg Order Value =
+DIVIDE([Total Revenue], [Total Orders], 0)
+
+Avg Discount % =
+AVERAGE(fact_sales[discount_pct]) * 100
+
+Total Returns =
+CALCULATE(COUNTROWS(fact_sales), fact_sales[return_flag] = TRUE())
+
+Return Rate % =
+DIVIDE([Total Returns], COUNTROWS(fact_sales), 0) * 100
+
+
+// ── TIME INTELLIGENCE ──────────────────────────────────────
+
+Revenue MTD =
+TOTALMTD([Total Revenue], dim_date[full_date])
+
+Revenue QTD =
+TOTALQTD([Total Revenue], dim_date[full_date])
+
+Revenue YTD =
+TOTALYTD([Total Revenue], dim_date[full_date])
+
+Revenue PYTD =
+CALCULATE([Total Revenue], SAMEPERIODLASTYEAR(dim_date[full_date]))
+
+YoY Revenue Growth % =
+DIVIDE([Total Revenue] - [Revenue PYTD], [Revenue PYTD], 0) * 100
+
+Revenue Last 30 Days =
+CALCULATE(
+    [Total Revenue],
+    DATESINPERIOD(dim_date[full_date], LASTDATE(dim_date[full_date]), -30, DAY)
+)
+
+Revenue Last 90 Days =
+CALCULATE(
+    [Total Revenue],
+    DATESINPERIOD(dim_date[full_date], LASTDATE(dim_date[full_date]), -90, DAY)
+)
+
+Orders PYTD =
+CALCULATE([Total Orders], SAMEPERIODLASTYEAR(dim_date[full_date]))
+
+YoY Orders Growth % =
+DIVIDE([Total Orders] - [Orders PYTD], [Orders PYTD], 0) * 100
+
+
+// ── CUSTOMER ANALYSIS ──────────────────────────────────────
+
+Total Customers =
+DISTINCTCOUNT(fact_sales[customer_id])
+
+Revenue Per Customer =
+DIVIDE([Total Revenue], [Total Customers], 0)
+
+New Customers (This Year) =
+CALCULATE(
+    DISTINCTCOUNT(fact_sales[customer_id]),
+    FILTER(dim_customer, YEAR(dim_customer[registration_date]) = MAX(dim_date[year]))
+)
+
+Top Customer Segment =
+CALCULATE(
+    FIRSTNONBLANK(dim_customer[segment], 1),
+    TOPN(1,
+        SUMMARIZE(fact_sales, dim_customer[segment], "Rev", [Total Revenue]),
+        [Rev], DESC
+    )
+)
+
+Repeat Customer Rate % =
+DIVIDE(
+    CALCULATE(DISTINCTCOUNT(fact_sales[customer_id]),
+              FILTER(SUMMARIZE(fact_sales, fact_sales[customer_id], "Orders", [Total Orders]),
+                     [Orders] > 1)),
+    [Total Customers],
+    0
+) * 100
+
+
+// ── PRODUCT ANALYSIS ───────────────────────────────────────
+
+Top Product by Revenue =
+CALCULATE(
+    FIRSTNONBLANK(dim_product[product_name], 1),
+    TOPN(1,
+        SUMMARIZE(fact_sales, dim_product[product_name], "Rev", [Total Revenue]),
+        [Rev], DESC
+    )
+)
+
+Category Revenue Share % =
+DIVIDE([Total Revenue],
+    CALCULATE([Total Revenue], ALL(dim_product[category])),
+    0
+) * 100
+
+Avg Profit Per Product =
+DIVIDE([Total Profit], DISTINCTCOUNT(fact_sales[product_id]), 0)
+
+
+// ── CHANNEL ANALYSIS ───────────────────────────────────────
+
+Channel Revenue Share % =
+DIVIDE([Total Revenue],
+    CALCULATE([Total Revenue], ALL(dim_channel)),
+    0
+) * 100
+
+Top Channel =
+CALCULATE(
+    FIRSTNONBLANK(dim_channel[channel_name], 1),
+    TOPN(1,
+        SUMMARIZE(fact_sales, dim_channel[channel_name], "Rev", [Total Revenue]),
+        [Rev], DESC
+    )
+)
+
+
+// ── INVENTORY (from SharePoint data) ───────────────────────
+
+Total Stock Qty =
+SUM(stg_inventory[stock_qty])
+
+Low Stock Products =
+CALCULATE(
+    COUNTROWS(stg_inventory),
+    stg_inventory[stock_qty] < stg_inventory[reorder_level]
+)
+
+Inventory Health % =
+DIVIDE(
+    CALCULATE(COUNTROWS(stg_inventory), stg_inventory[stock_qty] >= stg_inventory[reorder_level]),
+    COUNTROWS(stg_inventory),
+    0
+) * 100
+
+
+// ── CONDITIONAL FORMATTING ─────────────────────────────────
+
+Profit Margin Color =
+SWITCH(
+    TRUE(),
+    [Profit Margin %] >= 35, "#00B050",
+    [Profit Margin %] >= 20, "#FF8C00",
+    "#C00000"
+)
+
+Revenue Growth Color =
+SWITCH(
+    TRUE(),
+    [YoY Revenue Growth %] >= 10, "#00B050",
+    [YoY Revenue Growth %] >= 0,  "#FF8C00",
+    "#C00000"
+)

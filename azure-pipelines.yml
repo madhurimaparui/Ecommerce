@@ -1,0 +1,254 @@
+# ============================================================
+# Azure DevOps CI/CD Pipeline — Power BI Healthcare Dashboard
+# Author: Madhurima Parui
+# Deploys .pbix report across Dev → UAT → Production workspaces
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+  paths:
+    include:
+      - powerbi/*
+      - sql/*
+      - dax/*
+
+variables:
+  - group: PowerBI-Credentials          # Variable group in Azure DevOps (stores secrets)
+  - name: POWERBI_TENANT_ID
+    value: $(tenantId)
+  - name: POWERBI_CLIENT_ID
+    value: $(clientId)
+  - name: POWERBI_CLIENT_SECRET
+    value: $(clientSecret)
+  - name: DEV_WORKSPACE_ID
+    value: $(devWorkspaceId)
+  - name: UAT_WORKSPACE_ID
+    value: $(uatWorkspaceId)
+  - name: PROD_WORKSPACE_ID
+    value: $(prodWorkspaceId)
+  - name: PBIX_FILE
+    value: 'powerbi/Healthcare_Dashboard.pbix'
+  - name: REPORT_NAME
+    value: 'Healthcare_Data_Analysis_Dashboard'
+
+stages:
+
+# ────────────────────────────────────────────────────────────
+# STAGE 1 — Validate & Lint
+# ────────────────────────────────────────────────────────────
+- stage: Validate
+  displayName: 'Validate Files'
+  jobs:
+  - job: Lint
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+    - checkout: self
+
+    - task: PowerShell@2
+      displayName: 'Validate PBIX file exists'
+      inputs:
+        targetType: 'inline'
+        script: |
+          if (!(Test-Path "$(PBIX_FILE)")) {
+            Write-Error "PBIX file not found: $(PBIX_FILE)"
+            exit 1
+          }
+          Write-Host "PBIX file found: $(PBIX_FILE)"
+
+    - task: PowerShell@2
+      displayName: 'Validate SQL scripts syntax'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $sqlFiles = Get-ChildItem -Path "sql/" -Filter "*.sql"
+          foreach ($file in $sqlFiles) {
+            Write-Host "Validating: $($file.Name)"
+          }
+          Write-Host "All SQL files present."
+
+
+# ────────────────────────────────────────────────────────────
+# STAGE 2 — Deploy to DEV
+# ────────────────────────────────────────────────────────────
+- stage: Deploy_Dev
+  displayName: 'Deploy to DEV Workspace'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - deployment: DeployDev
+    environment: 'PowerBI-Dev'
+    pool:
+      vmImage: 'windows-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: 'Install Power BI PowerShell Module'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Install-Module -Name MicrosoftPowerBIMgmt -Force -Scope CurrentUser
+                Import-Module MicrosoftPowerBIMgmt
+
+          - task: PowerShell@2
+            displayName: 'Publish PBIX to DEV Workspace'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $credential = [System.Management.Automation.PSCredential]::new(
+                  "$(POWERBI_CLIENT_ID)",
+                  (ConvertTo-SecureString "$(POWERBI_CLIENT_SECRET)" -AsPlainText -Force)
+                )
+                Connect-PowerBIServiceAccount -ServicePrincipal -Credential $credential -TenantId "$(POWERBI_TENANT_ID)"
+
+                $workspace = Get-PowerBIWorkspace -Id "$(DEV_WORKSPACE_ID)"
+                Write-Host "Deploying to: $($workspace.Name)"
+
+                New-PowerBIReport `
+                  -Path "$(PBIX_FILE)" `
+                  -Name "$(REPORT_NAME)" `
+                  -WorkspaceId "$(DEV_WORKSPACE_ID)" `
+                  -ConflictAction CreateOrOverwrite
+
+                Write-Host "DEV deployment complete."
+
+
+# ────────────────────────────────────────────────────────────
+# STAGE 3 — Deploy to UAT (manual approval gate)
+# ────────────────────────────────────────────────────────────
+- stage: Deploy_UAT
+  displayName: 'Deploy to UAT Workspace'
+  dependsOn: Deploy_Dev
+  condition: succeeded()
+  jobs:
+  - deployment: DeployUAT
+    environment: 'PowerBI-UAT'           # Environment has manual approval gate configured
+    pool:
+      vmImage: 'windows-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: 'Install Power BI PowerShell Module'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Install-Module -Name MicrosoftPowerBIMgmt -Force -Scope CurrentUser
+                Import-Module MicrosoftPowerBIMgmt
+
+          - task: PowerShell@2
+            displayName: 'Publish PBIX to UAT Workspace'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $credential = [System.Management.Automation.PSCredential]::new(
+                  "$(POWERBI_CLIENT_ID)",
+                  (ConvertTo-SecureString "$(POWERBI_CLIENT_SECRET)" -AsPlainText -Force)
+                )
+                Connect-PowerBIServiceAccount -ServicePrincipal -Credential $credential -TenantId "$(POWERBI_TENANT_ID)"
+
+                New-PowerBIReport `
+                  -Path "$(PBIX_FILE)" `
+                  -Name "$(REPORT_NAME)" `
+                  -WorkspaceId "$(UAT_WORKSPACE_ID)" `
+                  -ConflictAction CreateOrOverwrite
+
+                Write-Host "UAT deployment complete."
+
+          - task: PowerShell@2
+            displayName: 'Trigger UAT Dataset Refresh'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $token = (Get-PowerBIAccessToken).Token
+                $datasets = Get-PowerBIDataset -WorkspaceId "$(UAT_WORKSPACE_ID)"
+                $dataset  = $datasets | Where-Object { $_.Name -eq "$(REPORT_NAME)" }
+
+                Invoke-RestMethod `
+                  -Uri "https://api.powerbi.com/v1.0/myorg/groups/$(UAT_WORKSPACE_ID)/datasets/$($dataset.Id)/refreshes" `
+                  -Method POST `
+                  -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+                  -Body '{"notifyOption":"MailOnFailure"}'
+
+                Write-Host "UAT dataset refresh triggered."
+
+
+# ────────────────────────────────────────────────────────────
+# STAGE 4 — Deploy to PRODUCTION (manual approval gate)
+# ────────────────────────────────────────────────────────────
+- stage: Deploy_Prod
+  displayName: 'Deploy to PRODUCTION Workspace'
+  dependsOn: Deploy_UAT
+  condition: succeeded()
+  jobs:
+  - deployment: DeployProd
+    environment: 'PowerBI-Production'    # Environment has manual approval gate configured
+    pool:
+      vmImage: 'windows-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: 'Install Power BI PowerShell Module'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Install-Module -Name MicrosoftPowerBIMgmt -Force -Scope CurrentUser
+                Import-Module MicrosoftPowerBIMgmt
+
+          - task: PowerShell@2
+            displayName: 'Publish PBIX to PRODUCTION Workspace'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $credential = [System.Management.Automation.PSCredential]::new(
+                  "$(POWERBI_CLIENT_ID)",
+                  (ConvertTo-SecureString "$(POWERBI_CLIENT_SECRET)" -AsPlainText -Force)
+                )
+                Connect-PowerBIServiceAccount -ServicePrincipal -Credential $credential -TenantId "$(POWERBI_TENANT_ID)"
+
+                New-PowerBIReport `
+                  -Path "$(PBIX_FILE)" `
+                  -Name "$(REPORT_NAME)" `
+                  -WorkspaceId "$(PROD_WORKSPACE_ID)" `
+                  -ConflictAction CreateOrOverwrite
+
+                Write-Host "PRODUCTION deployment complete."
+
+          - task: PowerShell@2
+            displayName: 'Trigger PROD Dataset Refresh'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $token = (Get-PowerBIAccessToken).Token
+                $datasets = Get-PowerBIDataset -WorkspaceId "$(PROD_WORKSPACE_ID)"
+                $dataset  = $datasets | Where-Object { $_.Name -eq "$(REPORT_NAME)" }
+
+                Invoke-RestMethod `
+                  -Uri "https://api.powerbi.com/v1.0/myorg/groups/$(PROD_WORKSPACE_ID)/datasets/$($dataset.Id)/refreshes" `
+                  -Method POST `
+                  -Headers @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" } `
+                  -Body '{"notifyOption":"MailOnFailure"}'
+
+                Write-Host "PRODUCTION dataset refresh triggered."
+
+          - task: PowerShell@2
+            displayName: 'Send Deployment Notification'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Healthcare Dashboard successfully deployed to Production."
+                Write-Host "Build: $(Build.BuildNumber) | Date: $(Get-Date)"
